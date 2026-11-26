@@ -1,0 +1,79 @@
+{
+  "dataset": "JHU-CROWD++",
+  "dataset_root": "C:\\SA_CC\\Crowd_Counting_Module\\P2PNet\\dataset\\JHU-CROWD++",
+  "annotation_policy": "Malformed and non-finite rows are skipped. Finite out-of-bounds head points are clamped to image bounds and retained; they are counted separately as invalid annotations.",
+  "splits": {
+    "train": {
+      "manifest_entries": 2272,
+      "number_of_images": 2272,
+      "number_of_paired_images": 2272,
+      "total_annotations": 844642,
+      "minimum_people_per_image": 0,
+      "maximum_people_per_image": 25791,
+      "average_people_per_image": 371.76144366197184,
+      "statistics_images": 2272,
+      "missing_image_annotation_pairs": {
+        "count": 0,
+        "missing_images": [],
+        "missing_annotations": []
+      },
+      "invalid_annotations": {
+        "malformed_or_non_finite": 0,
+        "out_of_bounds_clamped": 255,
+        "total": 255
+      },
+      "unlisted_image_files": [],
+      "unlisted_annotation_files": [],
+      "duplicate_manifest_entries": [],
+      "unreadable_images": []
+    },
+    "validation": {
+      "manifest_entries": 500,
+      "number_of_images": 500,
+      "number_of_paired_images": 500,
+      "total_annotations": 148504,
+      "minimum_people_per_image": 2,
+      "maximum_people_per_image": 5929,
+      "average_people_per_image": 297.008,
+      "statistics_images": 500,
+      "missing_image_annotation_pairs": {
+        "count": 0,
+        "missing_images": [],
+        "missing_annotations": []
+      },
+      "invalid_annotations": {
+        "malformed_or_non_finite": 0,
+        "out_of_bounds_clamped": 74,
+        "total": 74
+      },
+      "unlisted_image_files": [],
+      "unlisted_annotation_files": [],
+      "duplicate_manifest_entries": [],
+      "unreadable_images": []
+    },
+    "test": {
+      "manifest_entries": 1600,
+      "number_of_images": 1600,
+      "number_of_paired_images": 1600,
+      "total_annotations": 521859,
+      "minimum_people_per_image": 0,
+      "maximum_people_per_image": 9059,
+      "average_people_per_image": 326.161875,
+      "statistics_images": 1600,
+      "missing_image_annotation_pairs": {
+        "count": 0,
+        "missing_images": [],
+        "missing_annotations": []
+      },
+      "invalid_annotations": {
+        "malformed_or_non_finite": 0,
+        "out_of_bounds_clamped": 161,
+        "total": 161
+      },
+      "unlisted_image_files": [],
+      "unlisted_annotation_files": [],
+      "duplicate_manifest_entries": [],
+      "unreadable_images": []
+    }
+  }
+}

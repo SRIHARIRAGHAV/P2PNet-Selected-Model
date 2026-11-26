@@ -1,0 +1,9 @@
+{
+  "torch_installed": true,
+  "torch_version": "2.14.1+cpu",
+  "cuda_build": null,
+  "cuda_available": false,
+  "gpu_count": 0,
+  "gpu_names": [],
+  "status": "cuda_unavailable"
+}

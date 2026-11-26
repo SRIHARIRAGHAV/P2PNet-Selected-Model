@@ -1,0 +1,54 @@
+{
+  "dataset_root": "C:\\SA_CC\\Crowd_Counting_Module\\P2PNet\\dataset\\JHU-CROWD++",
+  "train": {
+    "images": 2272,
+    "annotations": 2272,
+    "missing_annotations": 0,
+    "missing_images": 0,
+    "points": 844642,
+    "out_of_bounds_points": 255,
+    "clamped_points": 255,
+    "malformed_points": 0,
+    "first_out_of_bounds_example": [
+      "C:\\SA_CC\\Crowd_Counting_Module\\P2PNet\\dataset\\JHU-CROWD++\\train\\gt\\0057.txt",
+      2381.0,
+      3280.0,
+      4928,
+      3280
+    ]
+  },
+  "validation": {
+    "images": 500,
+    "annotations": 500,
+    "missing_annotations": 0,
+    "missing_images": 0,
+    "points": 148504,
+    "out_of_bounds_points": 74,
+    "clamped_points": 74,
+    "malformed_points": 0,
+    "first_out_of_bounds_example": [
+      "C:\\SA_CC\\Crowd_Counting_Module\\P2PNet\\dataset\\JHU-CROWD++\\val\\gt\\0042.txt",
+      63.0,
+      400.0,
+      400,
+      400
+    ]
+  },
+  "test": {
+    "images": 1600,
+    "annotations": 1600,
+    "missing_annotations": 0,
+    "missing_images": 0,
+    "points": 521859,
+    "out_of_bounds_points": 161,
+    "clamped_points": 161,
+    "malformed_points": 0,
+    "first_out_of_bounds_example": [
+      "C:\\SA_CC\\Crowd_Counting_Module\\P2PNet\\dataset\\JHU-CROWD++\\test\\gt\\0115.txt",
+      469.0,
+      355.0,
+      597,
+      350
+    ]
+  }
+}
