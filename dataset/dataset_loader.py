@@ -4,9 +4,12 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
-
 from .annotations import load_jhu_annotations
-from .transforms import training_transform, extract_random_patches
+from .transforms import (
+    extract_random_patches,
+    resize_for_model,
+    transform_image,
+)
 
 
 _SPLIT_CONFIG = {
@@ -61,7 +64,32 @@ class JHUCrowdDataset(Dataset):
                 samples.append((image_path, annotation_path))
         self.samples = samples
         self.image_paths = [image_path for image_path, _ in samples]
-        self.transform = training_transform()
+        self.transform = transform_image
+        self.empty_annotation_count = 0
+        self.clamped_annotation_count = 0
+        if dataset.get("validate_at_startup", True):
+            self._validate_samples()
+
+    def _validate_samples(self):
+        for image_path, annotation_path in self.samples:
+            try:
+                with Image.open(image_path) as image:
+                    width, height = image.size
+                    image.verify()
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    f"Unreadable image in {self.split} split: {image_path}"
+                ) from error
+            annotation_stats = {}
+            points = load_jhu_annotations(
+                annotation_path,
+                width,
+                height,
+                correction_stats=annotation_stats,
+            )
+            if len(points) == 0:
+                self.empty_annotation_count += 1
+            self.clamped_annotation_count += annotation_stats["clamped_points"]
 
     def __len__(self):
         return len(self.samples)
@@ -87,7 +115,23 @@ class JHUCrowdDataset(Dataset):
                 random_scale_max=augmentation["random_scale_max"],
                 random_flip=augmentation["random_flip"],
             )
+            if (
+                patches.ndim != 4
+                or patches.shape[1] != 3
+                or not torch.isfinite(patches).all()
+            ):
+                raise ValueError(
+                    f"Invalid training tensor generated from {image_path}"
+                )
             for target in targets:
+                if (
+                    target["point"].ndim != 2
+                    or target["point"].shape[1] != 2
+                    or not torch.isfinite(target["point"]).all()
+                ):
+                    raise ValueError(
+                        f"Invalid training points generated from {annotation_path}"
+                    )
                 target["image_id"] = torch.tensor([index], dtype=torch.long)
             if self.split == "train":
                 return patches, targets
@@ -96,13 +140,32 @@ class JHUCrowdDataset(Dataset):
                 "image_path": str(image_path),
             }
 
+        original_width, original_height = image.size
+        image, scale_x, scale_y = resize_for_model(
+            image,
+            int(self.config["dataset"]["validation_max_side"]),
+        )
+        points[:, 0] *= scale_x
+        points[:, 1] *= scale_y
         tensor = self.transform(image)
+        if (
+            tensor.ndim != 3
+            or tensor.shape[0] != 3
+            or not torch.isfinite(tensor).all()
+        ):
+            raise ValueError(f"Invalid validation tensor generated from {image_path}")
         target = {
             "point": torch.from_numpy(points.astype(np.float32)),
             "labels": torch.ones(len(points), dtype=torch.long),
             "image_id": torch.tensor([index], dtype=torch.long),
             "image_path": str(image_path),
+            "scale_x": original_width / image.width,
+            "scale_y": original_height / image.height,
         }
+        if target["point"].ndim != 2 or target["point"].shape[1] != 2:
+            raise ValueError(
+                f"Invalid validation points generated from {annotation_path}"
+            )
         return tensor, target
 
 
@@ -110,13 +173,20 @@ def collate_train(batch):
     tensors = []
     targets = []
     for patches, patch_targets in batch:
-        if patches.shape[0] != len(patch_targets):
+        if (
+            patches.ndim != 4
+            or patches.shape[1] != 3
+            or patches.shape[0] != len(patch_targets)
+        ):
             raise ValueError("Each training patch must have one target dictionary")
         tensors.append(patches)
         targets.extend(patch_targets)
     if not tensors:
         raise ValueError("Cannot collate an empty training batch")
-    return torch.cat(tensors, dim=0), targets
+    images = torch.cat(tensors, dim=0)
+    if not torch.isfinite(images).all():
+        raise ValueError("Training batch contains NaN or Inf image values")
+    return images, targets
 
 
 def collate_validation(batch, stride=8):
@@ -126,6 +196,17 @@ def collate_validation(batch, stride=8):
         raise ValueError("stride must be positive")
     tensors = [item[0] for item in batch]
     targets = [item[1] for item in batch]
+    if any(tensor.ndim != 3 or tensor.shape[0] != 3 for tensor in tensors):
+        raise ValueError("Validation images must have shape (3, H, W)")
+    for target in targets:
+        points = target.get("point")
+        if (
+            not torch.is_tensor(points)
+            or points.ndim != 2
+            or points.shape[1] != 2
+            or not torch.isfinite(points).all()
+        ):
+            raise ValueError("Validation targets must contain finite (N, 2) points")
     max_height = (max(t.shape[1] for t in tensors) + stride - 1) // stride * stride
     max_width = (max(t.shape[2] for t in tensors) + stride - 1) // stride * stride
     padded = torch.zeros(

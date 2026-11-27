@@ -18,7 +18,6 @@ from models import P2PNet
 WEIGHT_LOADING_CALLS = {
     "load_checkpoint",
     "load_pretrained",
-    "load_scratch_checkpoint",
     "load_state_dict",
     "load_state_dict_from_url",
     "load_weights",

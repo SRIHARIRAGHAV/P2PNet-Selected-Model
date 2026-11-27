@@ -92,6 +92,7 @@ def validate_split(dataset_config, split):
             image_width=width,
             image_height=height,
             correction_stats=annotation_stats,
+            strict=False,
         )
         point_counts.append(int(len(points)))
         malformed = (
@@ -139,7 +140,7 @@ def build_report(config):
         "dataset": dataset_config["name"],
         "dataset_root": str(Path(dataset_config["dataset_root"])),
         "annotation_policy": (
-            "Malformed and non-finite rows are skipped. Finite out-of-bounds "
+            "Malformed and non-finite rows are reported. Finite out-of-bounds "
             "head points are clamped to image bounds and retained; they are "
             "counted separately as invalid annotations."
         ),
@@ -160,17 +161,24 @@ def main():
     )
     parser.add_argument(
         "--output",
-        default=str(ROOT / "logs" / "dataset_validation.json"),
+        help="Optional JSON report path; existing files require --overwrite.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow replacing the selected report file.",
     )
     args = parser.parse_args()
 
     report = build_report(load_config(args.config))
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as handle:
-        json.dump(report, handle, indent=2)
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "w" if args.overwrite else "x"
+        with output_path.open(mode, encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2)
+        print("Report saved to: {}".format(output_path))
     print(json.dumps(report, indent=2))
-    print("Report saved to: {}".format(output_path))
 
 
 if __name__ == "__main__":

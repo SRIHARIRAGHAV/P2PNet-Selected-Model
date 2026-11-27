@@ -16,48 +16,44 @@ class HungarianMatcherCrowd(nn.Module):
 
     @torch.no_grad()
     def forward(self, outputs, targets):
-        probabilities = outputs["pred_logits"].float().softmax(-1)
-        predicted_points = outputs["pred_points"].float()
+        logits = outputs["pred_logits"]
+        predicted_points = outputs["pred_points"]
         matches = []
 
         for batch_index, target in enumerate(targets):
-            target_points = target["point"].to(
-                device=predicted_points.device,
-                dtype=predicted_points.dtype,
-            )
+            target_points = target["point"].detach().float().cpu()
             if target_points.numel() == 0:
                 empty = torch.empty(
                     0,
                     dtype=torch.long,
-                    device=predicted_points.device,
                 )
                 matches.append((empty, empty))
                 continue
 
-            class_cost = -probabilities[batch_index, :, 1, None].expand(
+            probabilities = (
+                logits[batch_index].detach().float().cpu().softmax(-1)
+            )
+            class_cost = -probabilities[:, 1, None].expand(
                 -1,
                 target_points.shape[0],
             )
             point_cost = torch.cdist(
-                predicted_points[batch_index],
+                predicted_points[batch_index].detach().float().cpu(),
                 target_points,
                 p=2,
             )
-            total_cost = self.cost_class * class_cost + self.cost_point * point_cost
+            point_cost.mul_(self.cost_point)
+            point_cost.add_(class_cost, alpha=self.cost_class)
+            if not torch.isfinite(point_cost).all():
+                raise ValueError(
+                    f"Non-finite Hungarian cost matrix for batch item {batch_index}"
+                )
             source_indices, target_indices = linear_sum_assignment(
-                total_cost.detach().cpu().numpy()
+                point_cost.numpy()
             )
             matches.append((
-                torch.as_tensor(
-                    source_indices,
-                    dtype=torch.long,
-                    device=predicted_points.device,
-                ),
-                torch.as_tensor(
-                    target_indices,
-                    dtype=torch.long,
-                    device=predicted_points.device,
-                ),
+                torch.as_tensor(source_indices, dtype=torch.long),
+                torch.as_tensor(target_indices, dtype=torch.long),
             ))
         return matches
 
@@ -102,12 +98,15 @@ class SetCriterionCrowd(nn.Module):
         point_count = 0
 
         for batch_index, (source_indices, target_indices) in enumerate(matches):
-            target_points = targets[batch_index]["point"].to(predicted_points.device)
             if source_indices.numel() == 0:
                 continue
+            source_indices = source_indices.to(predicted_logits.device)
+            target_indices = target_indices.to(targets[batch_index]["point"].device)
             target_classes[batch_index, source_indices] = 1
             selected_points = predicted_points[batch_index, source_indices]
-            matched_points = target_points[target_indices]
+            matched_points = targets[batch_index]["point"][target_indices].to(
+                predicted_points.device
+            )
             point_losses.append(
                 F.mse_loss(
                     selected_points.float(),
@@ -115,7 +114,7 @@ class SetCriterionCrowd(nn.Module):
                     reduction="sum",
                 )
             )
-            point_count += target_points.shape[0]
+            point_count += targets[batch_index]["point"].shape[0]
 
         classification_loss = F.cross_entropy(
             predicted_logits.float().transpose(1, 2),

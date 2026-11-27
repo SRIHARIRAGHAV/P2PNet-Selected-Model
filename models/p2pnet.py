@@ -5,6 +5,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .backbone import VGG16BNBackbone
+from .criterion import HungarianMatcherCrowd, SetCriterionCrowd
 
 
 def _initialize_randomly(module):
@@ -111,6 +112,17 @@ class P2PNet(nn.Module):
         _initialize_randomly(self)
 
     def forward(self, images):
+        if (
+            images.ndim != 4
+            or images.shape[1] != 3
+            or images.shape[2] < 32
+            or images.shape[3] < 32
+            or not images.is_floating_point()
+        ):
+            raise ValueError(
+                "P2PNet input must be floating point with shape (B, 3, H, W) "
+                "and H, W >= 32"
+            )
         c3, c4, c5 = self.backbone(images)
         features = self.fpn(c3, c4, c5)
         batch_size, _, height, width = features.shape
@@ -123,7 +135,7 @@ class P2PNet(nn.Module):
             self.num_classes + 1,
         )
 
-        offsets = self.regression(features)
+        offsets = self.regression(features).float()
         offsets = offsets.permute(0, 2, 3, 1).contiguous()
         offsets = offsets.view(batch_size, -1, 2) * 100.0
         anchors = generate_shifted_anchors(
@@ -133,7 +145,32 @@ class P2PNet(nn.Module):
             row=self.row,
             line=self.line,
             device=features.device,
-            dtype=features.dtype,
+            dtype=torch.float32,
         )
         points = offsets + anchors.unsqueeze(0)
         return {"pred_logits": logits, "pred_points": points}
+
+
+def build_p2pnet(config):
+    model_config = config["model"]
+    if model_config.get("pretrained") is not False:
+        raise RuntimeError("Pretrained P2PNet initialization is forbidden.")
+    if config["training"].get("mode") != "scratch":
+        raise RuntimeError("Only scratch training is permitted.")
+    model = P2PNet(
+        row=int(model_config["row"]),
+        line=int(model_config["line"]),
+        num_classes=int(model_config["num_classes"]),
+        pretrained=False,
+    )
+    matcher = HungarianMatcherCrowd(
+        cost_class=float(model_config["set_cost_class"]),
+        cost_point=float(model_config["set_cost_point"]),
+    )
+    criterion = SetCriterionCrowd(
+        num_classes=int(model_config["num_classes"]),
+        matcher=matcher,
+        eos_coef=float(model_config["eos_coef"]),
+        point_loss_coef=float(model_config["point_loss_coef"]),
+    )
+    return model, criterion

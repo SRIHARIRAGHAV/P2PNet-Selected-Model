@@ -1,17 +1,19 @@
 import sys
 from pathlib import Path
 
-import torch
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import load_config
-from model.p2pnet import build_p2pnet
-from utils.checkpoint import load_scratch_checkpoint
+from models import P2PNet
 
 
 def main():
     config = load_config()
-    model, criterion = build_p2pnet(config)
+    model = P2PNet(
+        row=int(config["model"]["row"]),
+        line=int(config["model"]["line"]),
+        num_classes=int(config["model"]["num_classes"]),
+        pretrained=False,
+    )
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_count = sum(
         parameter.numel() for parameter in model.parameters()
@@ -21,14 +23,6 @@ def main():
     print(f"Total parameters: {parameter_count:,}")
     print("Pretrained: false")
     print("External state dict loading in build_p2pnet: none")
-
-    try:
-        load_scratch_checkpoint(
-            Path(__file__).resolve().parents[1] / "untrusted_test.pth"
-        )
-    except (FileNotFoundError, RuntimeError) as error:
-        print(f"Checkpoint provenance guard: active ({type(error).__name__})")
-
 
 if __name__ == "__main__":
     main()

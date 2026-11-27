@@ -1,5 +1,4 @@
 import argparse
-from contextlib import nullcontext
 from copy import deepcopy
 import math
 from pathlib import Path
@@ -12,51 +11,27 @@ from torch.utils.tensorboard import SummaryWriter
 
 from config import load_config
 from dataset.dataset_loader import JHUCrowdDataset, collate_train, collate_validation
-from models import HungarianMatcherCrowd, P2PNet, SetCriterionCrowd
-from utils.checkpoint import save_checkpoint
+from models import build_p2pnet
+from utils.checkpoint import load_scratch_checkpoint, save_checkpoint
+from utils.device import (
+    amp_settings,
+    autocast_context,
+    cuda_memory_stats,
+    format_cuda_memory,
+    select_device,
+)
 from utils.logging_utils import TrainingLogger, process_ram_usage_mb
 from utils.metrics import crowd_metrics
-from utils.reproducibility import make_generator, seed_worker, set_seed
+from utils.reproducibility import (
+    capture_rng_state,
+    make_generator,
+    restore_rng_state,
+    seed_worker,
+    set_seed,
+)
 
 
 ROOT = Path(__file__).resolve().parent
-
-
-def select_device(config):
-    requested = str(config["gpu"]["device"]).lower()
-    mixed_precision = bool(config["gpu"]["mixed_precision"])
-    if requested == "cpu":
-        if mixed_precision:
-            raise RuntimeError("Mixed precision requires a CUDA device.")
-        return torch.device("cpu")
-
-    cuda_available = torch.cuda.is_available()
-    if requested == "cuda" and not cuda_available:
-        raise RuntimeError(
-            "CUDA training was requested with gpu.device=cuda, "
-            "but CUDA is unavailable in this PyTorch environment."
-        )
-    if requested == "auto" and not cuda_available:
-        if mixed_precision:
-            raise RuntimeError(
-                "Mixed precision was requested, but CUDA is unavailable."
-            )
-        return torch.device("cpu")
-    if requested not in {"auto", "cuda"}:
-        raise RuntimeError("gpu.device must be 'auto', 'cpu', or 'cuda'.")
-
-    index = int(config["gpu"]["gpu_device_index"])
-    if index < 0 or index >= torch.cuda.device_count():
-        raise RuntimeError(
-            f"Requested GPU index {index}, but only "
-            f"{torch.cuda.device_count()} CUDA device(s) are available."
-        )
-    torch.cuda.set_device(index)
-    device = torch.device("cuda", index)
-    print(f"CUDA device: {torch.cuda.get_device_name(index)}")
-    print(f"PyTorch: {torch.__version__}")
-    print(f"CUDA build: {torch.version.cuda}")
-    return device
 
 
 def configure_cpu_threads(config, device):
@@ -72,16 +47,22 @@ def validate_config(config):
         raise RuntimeError("Pretrained model initialization is forbidden.")
     if config["training"].get("mode") != "scratch":
         raise RuntimeError("training.mode must be 'scratch'.")
-    if config["training"].get("resume", False):
-        raise RuntimeError("Checkpoint resume is forbidden for scratch training.")
-    if config["training"].get("resume_checkpoint", ""):
-        raise RuntimeError("Checkpoint loading is forbidden for training.")
     if int(config["training"]["epochs"]) < 1:
         raise ValueError("training.epochs must be positive.")
     if int(config["training"]["validation_interval"]) < 1:
         raise ValueError("training.validation_interval must be positive.")
+    if int(config["training"]["gradient_accumulation_steps"]) < 1:
+        raise ValueError(
+            "training.gradient_accumulation_steps must be positive."
+        )
     if int(config["checkpoints"]["save_interval"]) < 1:
         raise ValueError("checkpoints.save_interval must be positive.")
+    if int(config["training"]["smoke_test_train_batches"]) < 1:
+        raise ValueError("training.smoke_test_train_batches must be positive.")
+    if int(config["training"]["smoke_test_validation_batches"]) < 1:
+        raise ValueError(
+            "training.smoke_test_validation_batches must be positive."
+        )
     if float(config["training"]["gradient_clip_norm"]) < 0:
         raise ValueError("training.gradient_clip_norm cannot be negative.")
     if float(config["training"]["learning_rate"]) <= 0:
@@ -98,32 +79,37 @@ def validate_config(config):
         raise ValueError("checkpoints.best_model_metric must be MAE or RMSE.")
     if int(config["dataset"]["num_workers"]) < 0:
         raise ValueError("dataset.num_workers cannot be negative.")
+    if int(config["dataset"]["prefetch_factor"]) < 1:
+        raise ValueError("dataset.prefetch_factor must be positive.")
+    if int(config["evaluation"]["batch_size"]) != 1:
+        raise ValueError("evaluation.batch_size must be 1.")
     if str(config["gpu"]["device"]).lower() not in {"auto", "cpu", "cuda"}:
         raise ValueError("gpu.device must be 'auto', 'cpu', or 'cuda'.")
     if str(config["gpu"]["amp_dtype"]).lower() not in {"float16", "bfloat16"}:
         raise ValueError("gpu.amp_dtype must be 'float16' or 'bfloat16'.")
+    if not 0.0 <= float(
+        config["evaluation"]["prediction_confidence_threshold"]
+    ) <= 1.0:
+        raise ValueError(
+            "evaluation.prediction_confidence_threshold must be in [0, 1]."
+        )
+    height, width = map(int, config["model"]["input_resolution"])
+    if height < 32 or width < 32 or height % 8 or width % 8:
+        raise ValueError(
+            "model.input_resolution dimensions must be at least 32 and "
+            "divisible by 8."
+        )
+    if int(config["dataset"]["augmentation"]["patch_size"]) != height:
+        raise ValueError(
+            "dataset.augmentation.patch_size must match the configured "
+            "square model.input_resolution."
+        )
+    if height != width:
+        raise ValueError("model.input_resolution must be square for patch training.")
 
 
 def build_model_and_criterion(config, device):
-    model_config = config["model"]
-    if model_config.get("pretrained") is not False:
-        raise RuntimeError("P2PNet pretrained initialization is forbidden.")
-    model = P2PNet(
-        row=int(model_config["row"]),
-        line=int(model_config["line"]),
-        num_classes=int(model_config["num_classes"]),
-        pretrained=False,
-    )
-    matcher = HungarianMatcherCrowd(
-        cost_class=float(model_config["set_cost_class"]),
-        cost_point=float(model_config["set_cost_point"]),
-    )
-    criterion = SetCriterionCrowd(
-        num_classes=int(model_config["num_classes"]),
-        matcher=matcher,
-        eos_coef=float(model_config["eos_coef"]),
-        point_loss_coef=float(model_config["point_loss_coef"]),
-    )
+    model, criterion = build_p2pnet(config)
     model.to(device)
     criterion.to(device)
     if any(parameter.device != device for parameter in model.parameters()):
@@ -143,6 +129,18 @@ def create_dataloaders(config, device, smoke_test=False):
         "validation",
         smoke_test=smoke_test,
     )
+    for dataset in (train_dataset, validation_dataset):
+        if dataset.empty_annotation_count:
+            print(
+                f"Dataset {dataset.split}: "
+                f"{dataset.empty_annotation_count} empty annotation file(s); "
+                "these images remain in the dataset."
+            )
+        if dataset.clamped_annotation_count:
+            print(
+                f"Dataset {dataset.split}: retained and clamped "
+                f"{dataset.clamped_annotation_count} out-of-bounds point(s)."
+            )
     if not len(train_dataset) or not len(validation_dataset):
         raise RuntimeError("Training or validation dataset is empty.")
 
@@ -167,6 +165,10 @@ def create_dataloaders(config, device, smoke_test=False):
         device.type == "cuda" and bool(gpu["pinned_memory"])
     )
     workers = int(config["dataset"]["num_workers"])
+    loader_options = (
+        {"prefetch_factor": int(config["dataset"]["prefetch_factor"])}
+        if workers > 0 else {}
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(training["batch_size"]),
@@ -177,10 +179,11 @@ def create_dataloaders(config, device, smoke_test=False):
         generator=make_generator(int(config["project"]["random_seed"])),
         collate_fn=collate_train,
         drop_last=False,
+        **loader_options,
     )
     validation_loader = DataLoader(
         validation_dataset,
-        batch_size=1,
+        batch_size=int(config["evaluation"]["batch_size"]),
         shuffle=False,
         num_workers=workers,
         pin_memory=use_pinned_memory,
@@ -188,6 +191,7 @@ def create_dataloaders(config, device, smoke_test=False):
         generator=make_generator(int(config["project"]["random_seed"]) + 1),
         collate_fn=collate_validation,
         drop_last=False,
+        **loader_options,
     )
     return train_loader, validation_loader
 
@@ -245,27 +249,6 @@ def build_scheduler(config, optimizer):
     )
 
 
-def _amp_settings(config, device):
-    enabled = device.type == "cuda" and bool(config["gpu"]["mixed_precision"])
-    dtype = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }[str(config["gpu"]["amp_dtype"]).lower()]
-    if enabled and dtype is torch.bfloat16:
-        if not torch.cuda.is_bf16_supported():
-            raise RuntimeError(
-                "bfloat16 mixed precision was requested, but the selected "
-                "CUDA device does not support it."
-            )
-    return enabled, dtype
-
-
-def _autocast_context(enabled, dtype):
-    if enabled:
-        return torch.autocast(device_type="cuda", dtype=dtype)
-    return nullcontext()
-
-
 def train_one_epoch(
     model,
     criterion,
@@ -278,27 +261,48 @@ def train_one_epoch(
 ):
     model.train()
     criterion.train()
-    amp_enabled, amp_dtype = _amp_settings(config, device)
+    amp_enabled, amp_dtype = amp_settings(config, device)
     loss_totals = {"total": 0.0, "classification": 0.0, "localization": 0.0}
     batch_count = 0
+    optimizer_steps = 0
+    accumulation_steps = int(config["training"]["gradient_accumulation_steps"])
+    batch_limit = len(loader)
+    if max_batches is not None:
+        batch_limit = min(batch_limit, max_batches)
+    if batch_limit == 0:
+        raise RuntimeError("Training loader produced no batches.")
+    optimizer.zero_grad(set_to_none=True)
 
     for batch_index, (images, targets) in enumerate(loader):
+        if batch_index >= batch_limit:
+            break
         non_blocking = (
-            device.type == "cuda" and bool(config["gpu"]["non_blocking"])
+            device.type == "cuda"
+            and bool(config["gpu"]["pinned_memory"])
+            and bool(config["gpu"]["non_blocking"])
         )
-        images = images.to(device, non_blocking=non_blocking)
-        targets = [
-            {
-                key: value.to(device) if torch.is_tensor(value) else value
-                for key, value in target.items()
-            }
-            for target in targets
-        ]
-        optimizer.zero_grad(set_to_none=True)
-        with _autocast_context(amp_enabled, amp_dtype):
-            outputs = model(images)
-            losses = criterion(outputs, targets)
-            total_loss = sum(losses.values())
+        try:
+            images = images.to(device, non_blocking=non_blocking)
+            with autocast_context(amp_enabled, amp_dtype, device):
+                outputs = model(images)
+                if (
+                    not torch.isfinite(outputs["pred_logits"]).all()
+                    or not torch.isfinite(outputs["pred_points"]).all()
+                ):
+                    raise RuntimeError(
+                        f"Model produced NaN or Inf values in batch "
+                        f"{batch_index + 1}."
+                    )
+                losses = criterion(outputs, targets)
+                total_loss = sum(losses.values())
+        except torch.cuda.OutOfMemoryError as error:
+            stats = cuda_memory_stats(device)
+            raise RuntimeError(
+                f"CUDA out of memory during training batch {batch_index + 1} "
+                f"with input shape {tuple(images.shape)}; "
+                f"{format_cuda_memory(stats)}. Reduce the configured "
+                "training batch size or crop/patch resolution."
+            ) from error
 
         loss_values = {
             "total": float(total_loss.detach().item()),
@@ -308,72 +312,110 @@ def train_one_epoch(
         if not all(math.isfinite(value) for value in loss_values.values()):
             raise RuntimeError(f"Non-finite training loss: {loss_values}")
 
-        if scaler is not None and scaler.is_enabled():
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)
-            if config["training"]["gradient_clip_norm"] > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    float(config["training"]["gradient_clip_norm"]),
-                )
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            total_loss.backward()
-            if config["training"]["gradient_clip_norm"] > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    float(config["training"]["gradient_clip_norm"]),
-                )
-            optimizer.step()
+        window_start = (batch_index // accumulation_steps) * accumulation_steps
+        window_size = min(accumulation_steps, batch_limit - window_start)
+        scaled_loss = total_loss / window_size
+        try:
+            if scaler is not None and scaler.is_enabled():
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+
+            should_step = (
+                (batch_index + 1) % accumulation_steps == 0
+                or batch_index + 1 == batch_limit
+            )
+            if should_step:
+                if scaler is not None and scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                if config["training"]["gradient_clip_norm"] > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        float(config["training"]["gradient_clip_norm"]),
+                    )
+                if scaler is not None and scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_steps += 1
+        except torch.cuda.OutOfMemoryError as error:
+            stats = cuda_memory_stats(device)
+            raise RuntimeError(
+                f"CUDA out of memory during training backward/optimizer "
+                f"for batch {batch_index + 1} with input shape "
+                f"{tuple(images.shape)}; {format_cuda_memory(stats)}."
+            ) from error
 
         for key, value in loss_values.items():
             loss_totals[key] += value
         batch_count += 1
-        if max_batches is not None and batch_count >= max_batches:
-            break
+        del outputs, losses, total_loss, scaled_loss, images
 
     if batch_count == 0:
         raise RuntimeError("Training loader produced no batches.")
-    return {key: value / batch_count for key, value in loss_totals.items()}
+    return {
+        **{key: value / batch_count for key, value in loss_totals.items()},
+        "optimizer_steps": optimizer_steps,
+    }
 
 
 @torch.inference_mode()
 def validate(model, criterion, loader, device, config, max_batches=None):
     model.eval()
     criterion.eval()
-    amp_enabled, amp_dtype = _amp_settings(config, device)
+    amp_enabled, amp_dtype = amp_settings(config, device)
     actual_counts = []
     predicted_counts = []
     loss_totals = {"total": 0.0, "classification": 0.0, "localization": 0.0}
     batch_count = 0
 
-    for images, targets in loader:
-        images = images.to(
-            device,
-            non_blocking=(
-                device.type == "cuda" and bool(config["gpu"]["non_blocking"])
-            ),
+    for batch_index, (images, targets) in enumerate(loader):
+        if max_batches is not None and batch_index >= max_batches:
+            break
+        non_blocking = (
+            device.type == "cuda"
+            and bool(config["gpu"]["pinned_memory"])
+            and bool(config["gpu"]["non_blocking"])
         )
-        device_targets = [
-            {
-                key: value.to(device) if torch.is_tensor(value) else value
-                for key, value in target.items()
-            }
-            for target in targets
-        ]
-        with _autocast_context(amp_enabled, amp_dtype):
-            outputs = model(images)
-            losses = criterion(outputs, device_targets)
+        try:
+            images = images.to(device, non_blocking=non_blocking)
+            with autocast_context(amp_enabled, amp_dtype, device):
+                outputs = model(images)
+                if (
+                    not torch.isfinite(outputs["pred_logits"]).all()
+                    or not torch.isfinite(outputs["pred_points"]).all()
+                ):
+                    raise RuntimeError(
+                        f"Model produced NaN or Inf values in validation "
+                        f"batch {batch_index + 1}."
+                    )
+                losses = criterion(outputs, targets)
+        except torch.cuda.OutOfMemoryError as error:
+            stats = cuda_memory_stats(device)
+            raise RuntimeError(
+                f"CUDA out of memory during validation batch {batch_index + 1} "
+                f"with input shape {tuple(images.shape)}; "
+                f"{format_cuda_memory(stats)}. Reduce "
+                "dataset.validation_max_side."
+            ) from error
         values = {
             "total": sum(losses.values()),
             "classification": losses["loss_ce"],
             "localization": losses["loss_point"],
         }
+        if not all(
+            math.isfinite(float(value.detach().item()))
+            for value in values.values()
+        ):
+            raise RuntimeError(
+                f"Non-finite validation loss in batch {batch_index + 1}."
+            )
         for key, value in values.items():
             loss_totals[key] += float(value.item())
 
-        scores = outputs["pred_logits"].softmax(-1)[..., 1]
+        scores = outputs["pred_logits"].float().softmax(-1)[..., 1]
         threshold = float(
             config["evaluation"]["prediction_confidence_threshold"]
         )
@@ -381,8 +423,7 @@ def validate(model, criterion, loader, device, config, max_batches=None):
             predicted_counts.append(int((scores[batch_index] > threshold).sum().item()))
             actual_counts.append(len(target["point"]))
         batch_count += 1
-        if max_batches is not None and batch_count >= max_batches:
-            break
+        del outputs, losses, values, images, scores
 
     if batch_count == 0:
         raise RuntimeError("Validation loader produced no batches.")
@@ -396,7 +437,7 @@ def validate(model, criterion, loader, device, config, max_batches=None):
 
 
 def _resolve_output_path(path):
-    path = Path(path)
+    path = Path(path).expanduser()
     return path if path.is_absolute() else ROOT / path
 
 
@@ -404,13 +445,9 @@ def _assert_fresh_outputs(
     checkpoint_dir,
     log_dir,
     tensorboard_dir,
-    best_metric_name,
 ):
-    protected = [
-        checkpoint_dir / "latest.pth",
-        checkpoint_dir / "best_{}.pth".format(best_metric_name.lower()),
-        log_dir / "history.csv",
-    ]
+    protected = list(checkpoint_dir.glob("*.pth"))
+    protected.append(log_dir / "history.csv")
     if tensorboard_dir.exists():
         protected.extend(tensorboard_dir.glob("events.out.tfevents.*"))
     existing = [path for path in protected if path.exists()]
@@ -421,26 +458,59 @@ def _assert_fresh_outputs(
         )
 
 
-def run_training(config, device, output_root=None, smoke_test=False):
-    set_seed(int(config["project"]["random_seed"]))
-    configure_cpu_threads(config, device)
-    model, criterion = build_model_and_criterion(config, device)
-    optimizer = build_optimizer(config, model)
-    scheduler = build_scheduler(config, optimizer)
+def _validate_resume_config(saved_config, config):
+    if not isinstance(saved_config, dict):
+        raise ValueError("Checkpoint does not contain a valid training config.")
+    comparable = {
+        "project": ("random_seed",),
+        "dataset": (
+            "name",
+            "dataset_root",
+            "train_manifest",
+            "validation_manifest",
+            "train_image_dir",
+            "train_annotation_dir",
+            "validation_image_dir",
+            "validation_annotation_dir",
+            "validation_max_side",
+            "augmentation",
+        ),
+        "model": tuple(config["model"].keys()),
+        "training": (
+            "mode",
+            "batch_size",
+            "optimizer",
+            "learning_rate",
+            "backbone_learning_rate",
+            "weight_decay",
+            "lr_scheduler",
+            "lr_drop",
+            "lr_gamma",
+            "gradient_accumulation_steps",
+            "gradient_clip_norm",
+        ),
+        "gpu": ("mixed_precision", "amp_dtype"),
+    }
+    for section, keys in comparable.items():
+        for key in keys:
+            if saved_config.get(section, {}).get(key) != config.get(
+                section, {}
+            ).get(key):
+                raise ValueError(
+                    f"Cannot resume: checkpoint config mismatch at "
+                    f"{section}.{key}."
+                )
 
-    amp_enabled, amp_dtype = _amp_settings(config, device)
-    scaler = None
-    if device.type == "cuda":
-        scaler = torch.amp.GradScaler(
-            "cuda",
-            enabled=amp_enabled and amp_dtype is torch.float16,
-        )
 
-    train_loader, validation_loader = create_dataloaders(
-        config,
-        device,
-        smoke_test=smoke_test,
-    )
+def run_training(
+    config,
+    device,
+    output_root=None,
+    smoke_test=False,
+    resume_checkpoint=None,
+):
+    if smoke_test and resume_checkpoint is not None:
+        raise ValueError("A smoke test cannot resume a training checkpoint.")
     if output_root is None:
         checkpoint_dir = _resolve_output_path(
             config["checkpoints"]["checkpoint_dir"]
@@ -449,38 +519,103 @@ def run_training(config, device, output_root=None, smoke_test=False):
         tensorboard_dir = _resolve_output_path(
             config["training"]["tensorboard_log_dir"]
         )
-        best_metric_name = str(
-            config["checkpoints"]["best_model_metric"]
-        ).upper()
-        _assert_fresh_outputs(
-            checkpoint_dir,
-            log_dir,
-            tensorboard_dir,
-            best_metric_name,
-        )
     else:
-        output_root = Path(output_root)
+        output_root = Path(output_root).expanduser().resolve()
         checkpoint_dir = output_root / "checkpoints"
         log_dir = output_root / "logs"
         tensorboard_dir = log_dir / "tensorboard"
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_dir=str(tensorboard_dir))
-    logger = TrainingLogger(log_dir)
-    threshold = float(
-        config["evaluation"]["prediction_confidence_threshold"]
-    )
-    epochs = 1 if smoke_test else int(config["training"]["epochs"])
-    save_interval = int(config["checkpoints"]["save_interval"])
-    validation_interval = int(config["training"]["validation_interval"])
     best_metric_name = str(
         config["checkpoints"]["best_model_metric"]
     ).upper()
     best_checkpoint_path = checkpoint_dir / "best_{}.pth".format(
         best_metric_name.lower()
     )
+    if resume_checkpoint is None:
+        _assert_fresh_outputs(
+            checkpoint_dir,
+            log_dir,
+            tensorboard_dir,
+        )
+    elif not Path(resume_checkpoint).is_file():
+        raise FileNotFoundError(
+            f"Resume checkpoint not found: {resume_checkpoint}"
+        )
+    elif not best_checkpoint_path.is_file():
+        raise FileNotFoundError(
+            "Resume requires the experiment's existing best checkpoint "
+            f"{best_checkpoint_path}; use the original output directory."
+        )
+
+    set_seed(int(config["project"]["random_seed"]))
+    configure_cpu_threads(config, device)
+    model, criterion = build_model_and_criterion(config, device)
+    optimizer = build_optimizer(config, model)
+    scheduler = build_scheduler(config, optimizer)
+
+    amp_enabled, amp_dtype = amp_settings(config, device)
+    scaler = None
+    if device.type == "cuda":
+        scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=amp_enabled and amp_dtype is torch.float16,
+        )
+
+    start_epoch = 0
+    global_step = 0
     best_metric_value = float("inf")
     latest_validation_metrics = {}
+    if resume_checkpoint is not None:
+        checkpoint = load_scratch_checkpoint(resume_checkpoint)
+        _validate_resume_config(checkpoint.get("config"), config)
+        model.load_state_dict(checkpoint["model"], strict=True)
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler_state = checkpoint.get("scheduler")
+        if scheduler_state is None:
+            raise ValueError("Cannot resume: checkpoint has no scheduler state.")
+        scheduler.load_state_dict(scheduler_state)
+        scaler_state = checkpoint.get("scaler")
+        if scaler is not None and scaler.is_enabled():
+            if scaler_state is None:
+                raise ValueError(
+                    "Cannot resume AMP training: checkpoint has no scaler state."
+                )
+            scaler.load_state_dict(scaler_state)
+        start_epoch = int(checkpoint["epoch"])
+        global_step = int(checkpoint.get("global_step", 0))
+        best_metric_value = float(checkpoint.get("best_metric", float("inf")))
+        latest_validation_metrics = dict(
+            checkpoint.get("validation_metrics", {})
+        )
+        if start_epoch >= int(config["training"]["epochs"]):
+            raise ValueError(
+                f"Checkpoint is already at epoch {start_epoch}; "
+                "increase training.epochs before resuming."
+            )
+
+    train_loader, validation_loader = create_dataloaders(
+        config,
+        device,
+        smoke_test=smoke_test,
+    )
+    if resume_checkpoint is not None:
+        rng_state = checkpoint.get("rng_state")
+        if rng_state is None:
+            print(
+                "Checkpoint has no RNG state; continuing from the configured "
+                "seed, not the exact interrupted random sequence."
+            )
+        else:
+            restore_rng_state(rng_state, train_loader, validation_loader)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(tensorboard_dir))
+    logger = TrainingLogger(log_dir, resume=resume_checkpoint is not None)
+    epochs = 1 if smoke_test else int(config["training"]["epochs"])
+    save_interval = int(config["checkpoints"]["save_interval"])
+    validation_interval = int(config["training"]["validation_interval"])
+    best_metric_name = str(
+        config["checkpoints"]["best_model_metric"]
+    ).upper()
     start_time = time.perf_counter()
     smoke_batches = (
         int(config["training"]["smoke_test_train_batches"])
@@ -492,7 +627,9 @@ def run_training(config, device, output_root=None, smoke_test=False):
     )
 
     try:
-        for epoch in range(epochs):
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        for epoch in range(start_epoch, epochs):
             epoch_started = time.perf_counter()
             train_losses = train_one_epoch(
                 model,
@@ -504,6 +641,7 @@ def run_training(config, device, output_root=None, smoke_test=False):
                 config,
                 max_batches=smoke_batches,
             )
+            global_step += int(train_losses.pop("optimizer_steps"))
             scheduler.step()
 
             should_validate = (
@@ -532,6 +670,12 @@ def run_training(config, device, output_root=None, smoke_test=False):
                         best_metric_value,
                         config,
                         validation_metrics=latest_validation_metrics,
+                        overwrite=True,
+                        global_step=global_step,
+                        rng_state=capture_rng_state(
+                            train_loader,
+                            validation_loader,
+                        ),
                     )
 
             validation_metrics = latest_validation_metrics
@@ -557,6 +701,16 @@ def run_training(config, device, output_root=None, smoke_test=False):
 
             for key, value in train_losses.items():
                 writer.add_scalar("train/loss_{}".format(key), value, epoch + 1)
+            memory_stats = (
+                cuda_memory_stats(device)
+                if config["gpu"]["memory_monitoring"] else {}
+            )
+            for key, value in memory_stats.items():
+                writer.add_scalar(
+                    "gpu_memory/{}".format(key),
+                    value,
+                    epoch + 1,
+                )
             for key in ("loss_total", "loss_classification", "loss_localization"):
                 if key in validation_metrics:
                     writer.add_scalar(
@@ -590,8 +744,15 @@ def run_training(config, device, output_root=None, smoke_test=False):
                     config,
                     validation_metrics=validation_metrics,
                     overwrite=True,
+                    global_step=global_step,
+                    rng_state=capture_rng_state(
+                        train_loader,
+                        validation_loader,
+                    ),
                 )
 
+            if memory_stats:
+                print("GPU memory: " + format_cuda_memory(memory_stats))
             print(
                 "Epoch {}/{}: loss={:.6f} cls={:.6f} point={:.6f} "
                 "val_MAE={} val_RMSE={} duration={:.2f}s".format(
@@ -625,6 +786,7 @@ def run_training(config, device, output_root=None, smoke_test=False):
         "tensorboard_dir": tensorboard_dir,
         "best_metric_name": best_metric_name,
         "best_metric_value": best_metric_value,
+        "global_step": global_step,
         "elapsed_seconds": time.perf_counter() - start_time,
     }
 
@@ -636,28 +798,18 @@ def main():
         default=str(ROOT / "configs" / "p2pnet_scratch.yaml"),
     )
     parser.add_argument("--smoke-test", action="store_true")
-    parser.add_argument(
-        "--resume",
-        nargs="?",
-        const="requested",
-        default=None,
-        help="Rejected: checkpoint resume is disabled for scratch training.",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        default=None,
-        help="Rejected: training never loads a checkpoint.",
-    )
+    parser.add_argument("--resume", help="Resume from a scratch training checkpoint.")
+    parser.add_argument("--output-dir", help="Use a fresh experiment output directory.")
     parser.add_argument(
         "--pretrained",
         action="store_true",
         help="Rejected: pretrained initialization is disabled.",
     )
     args = parser.parse_args()
-    if args.resume is not None or args.checkpoint is not None:
-        raise RuntimeError("Checkpoint loading/resume is forbidden for training.")
     if args.pretrained:
         raise RuntimeError("Pretrained model initialization is forbidden.")
+    if args.smoke_test and args.resume:
+        raise RuntimeError("--smoke-test and --resume cannot be used together.")
 
     config = load_config(args.config)
     validate_config(config)
@@ -684,7 +836,12 @@ def main():
                 )
             )
     else:
-        result = run_training(config, device)
+        result = run_training(
+            config,
+            device,
+            output_root=args.output_dir,
+            resume_checkpoint=args.resume,
+        )
         print(
             "Training complete. Best {}: {:.6f}".format(
                 result["best_metric_name"],

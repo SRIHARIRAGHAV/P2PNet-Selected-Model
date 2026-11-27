@@ -1,4 +1,7 @@
+import os
 from pathlib import Path
+import tempfile
+
 import torch
 
 
@@ -7,7 +10,7 @@ PROVENANCE = "P2PNet-Scratch-Selected_Model"
 
 def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch,
                     best_metric, config, validation_metrics=None,
-                    overwrite=False):
+                    overwrite=False, global_step=0, rng_state=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and not overwrite:
@@ -18,6 +21,8 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch,
         "training_mode": config.get("training", {}).get("mode", "scratch"),
         "random_seed": config.get("project", {}).get("random_seed"),
         "epoch": epoch,
+        "global_step": global_step,
+        "rng_state": rng_state,
         "validation_metrics": dict(validation_metrics or {}),
     }
     payload = {
@@ -33,7 +38,25 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch,
         "config": config,
         "pretrained": False,
     }
-    torch.save(payload, path)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            torch.save(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.exists() and not overwrite:
+            raise FileExistsError(f"Refusing to overwrite checkpoint: {path}")
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def load_scratch_checkpoint(path):

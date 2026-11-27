@@ -3,18 +3,44 @@ import math
 import numpy as np
 import torch
 from PIL import Image
-import torchvision.transforms as transforms
 
 
 IMAGE_MEAN = [0.485, 0.456, 0.406]
 IMAGE_STD = [0.229, 0.224, 0.225]
+_IMAGE_MEAN_TENSOR = torch.tensor(IMAGE_MEAN)[:, None, None]
+_IMAGE_STD_TENSOR = torch.tensor(IMAGE_STD)[:, None, None]
 
 
 def training_transform():
-    return transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGE_MEAN, std=IMAGE_STD),
-    ])
+    return transform_image
+
+
+def resize_for_model(image, max_side):
+    if max_side < 1:
+        raise ValueError("max_side must be positive")
+    width, height = image.size
+    if width < 1 or height < 1:
+        raise ValueError("image dimensions must be positive")
+    scale = min(1.0, max_side / max(width, height))
+    resized_width = max(1, round(width * scale))
+    resized_height = max(1, round(height * scale))
+    resized = (
+        image
+        if (resized_width, resized_height) == (width, height)
+        else image.resize(
+            (resized_width, resized_height),
+            Image.Resampling.BILINEAR,
+        )
+    )
+    return resized, resized_width / width, resized_height / height
+
+
+def transform_image(image):
+    array = np.asarray(image, dtype=np.float32)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("Model images must be RGB")
+    tensor = torch.from_numpy(array.transpose(2, 0, 1).copy()).div_(255.0)
+    return (tensor - _IMAGE_MEAN_TENSOR) / _IMAGE_STD_TENSOR
 
 
 def extract_random_patches(image, points, patch_size=128, patch_count=4,
@@ -42,8 +68,9 @@ def extract_random_patches(image, points, patch_size=128, patch_count=4,
     width, height = image.size
     if width < 1 or height < 1:
         raise ValueError("image dimensions must be positive")
-    new_width = max(patch_size, int(width * scale))
-    new_height = max(patch_size, int(height * scale))
+    scale = max(scale, patch_size / width, patch_size / height)
+    new_width = max(patch_size, round(width * scale))
+    new_height = max(patch_size, round(height * scale))
     resized = image.resize((new_width, new_height), Image.Resampling.BILINEAR)
     scaled_points = points.copy()
     scaled_points[:, 0] *= new_width / width

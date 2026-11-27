@@ -1,4 +1,5 @@
 import json
+import argparse
 import math
 import sys
 from pathlib import Path
@@ -61,6 +62,17 @@ def verify_split(root, image_dir, gt_dir, split):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--output",
+        default=str(
+            Path(__file__).resolve().parents[1]
+            / "logs"
+            / "dataset_verification.json"
+        ),
+    )
+    parser.add_argument("--overwrite", action="store_true")
+    args = parser.parse_args()
     config = load_config()
     root = Path(config["dataset"]["dataset_root"])
     report = {
@@ -84,9 +96,10 @@ def main():
             "test",
         ),
     }
-    output = Path(__file__).resolve().parents[1] / "logs" / "dataset_verification.json"
+    output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    with open(output, "w", encoding="utf-8") as handle:
+    mode = "w" if args.overwrite else "x"
+    with output.open(mode, encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
     print(json.dumps(report, indent=2))
 

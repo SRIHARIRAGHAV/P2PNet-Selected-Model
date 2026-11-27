@@ -3,12 +3,12 @@ import cv2
 import matplotlib.pyplot as plt
 
 
-def save_point_visualization(image_path, points, output_path, threshold=0.5):
+def save_point_visualization(image_path, points, output_path):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image = cv2.imread(str(image_path))
     if image is None:
-        return
+        raise FileNotFoundError(f"Could not read image for visualization: {image_path}")
     for point in points:
         cv2.circle(
             image,
@@ -17,7 +17,8 @@ def save_point_visualization(image_path, points, output_path, threshold=0.5):
             (0, 0, 255),
             -1,
         )
-    cv2.imwrite(str(output_path), image)
+    if not cv2.imwrite(str(output_path), image):
+        raise OSError(f"Could not write visualization image: {output_path}")
 
 
 def save_actual_vs_predicted(actual, predicted, output_path):

@@ -1,5 +1,9 @@
 import sys
+from copy import deepcopy
 from pathlib import Path
+import random
+
+import numpy as np
 import pytest
 import torch
 
@@ -7,17 +11,28 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from config import load_config
-from model.p2pnet import build_p2pnet
 from utils.checkpoint import load_scratch_checkpoint, save_checkpoint
-from train import select_device, validate_config
+from train import (
+    _validate_resume_config,
+    build_model_and_criterion,
+    select_device,
+    train_one_epoch,
+    validate_config,
+)
+from utils.reproducibility import (
+    capture_rng_state,
+    restore_rng_state,
+    set_seed,
+)
 
 
 def test_gradient_and_untrusted_checkpoint_guard(tmp_path):
     config = load_config()
-    model, criterion = build_p2pnet(config)
     expected_device = "cuda" if torch.cuda.is_available() else "cpu"
-    assert select_device(config).type == expected_device
-    images = torch.randn(1, 3, 128, 128)
+    device = select_device(config)
+    assert device.type == expected_device
+    model, criterion = build_model_and_criterion(config, device)
+    images = torch.randn(1, 3, 128, 128, device=device)
     targets = [{"point": torch.tensor([[64.0, 64.0]]), "labels": torch.ones(1, dtype=torch.long)}]
     outputs = model(images)
     losses = criterion(outputs, targets)
@@ -34,21 +49,19 @@ def test_gradient_and_untrusted_checkpoint_guard(tmp_path):
         pass
 
 
-def test_training_rejects_pretrained_and_checkpoint_resume():
+def test_training_rejects_pretrained_and_checks_resume_compatibility():
     config = load_config()
     config["model"]["pretrained"] = True
     with pytest.raises(RuntimeError, match="Pretrained"):
         validate_config(config)
 
     config = load_config()
-    config["training"]["resume"] = True
-    with pytest.raises(RuntimeError, match="resume"):
-        validate_config(config)
-
-    config = load_config()
-    config["training"]["resume_checkpoint"] = "existing.pth"
-    with pytest.raises(RuntimeError, match="Checkpoint loading"):
-        validate_config(config)
+    validate_config(config)
+    _validate_resume_config(deepcopy(config), config)
+    incompatible = deepcopy(config)
+    incompatible["model"]["row"] += 1
+    with pytest.raises(ValueError, match="model.row"):
+        _validate_resume_config(incompatible, config)
 
 
 def test_requested_cuda_fails_when_unavailable(monkeypatch):
@@ -87,6 +100,7 @@ def test_checkpoint_round_trip_restores_training_state_on_cpu(tmp_path):
         best_metric=1.5,
         config=config,
         validation_metrics=validation_metrics,
+        rng_state=capture_rng_state(),
     )
     checkpoint = load_scratch_checkpoint(checkpoint_path)
 
@@ -100,3 +114,64 @@ def test_checkpoint_round_trip_restores_training_state_on_cpu(tmp_path):
     assert checkpoint["training_mode"] == "scratch"
     assert checkpoint["random_seed"] == 42
     assert checkpoint["validation_metrics"] == validation_metrics
+    assert checkpoint["global_step"] == 0
+    assert checkpoint["rng_state"]["torch_cpu"].dtype == torch.uint8
+
+
+def test_rng_checkpoint_restores_python_numpy_and_torch_generators():
+    set_seed(19)
+    state = capture_rng_state()
+    expected = (
+        random.random(),
+        np.random.random(),
+        torch.rand(1),
+    )
+    set_seed(73)
+    restore_rng_state(state)
+    assert random.random() == expected[0]
+    assert np.random.random() == expected[1]
+    assert torch.equal(torch.rand(1), expected[2])
+
+
+def test_gradient_accumulation_steps_only_on_window_boundaries():
+    class ToyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def forward(self, images):
+            values = self.weight.expand(images.shape[0], 1, 2)
+            return {"pred_logits": values, "pred_points": values[..., :1].expand(-1, -1, 2)}
+
+    class ToyCriterion(torch.nn.Module):
+        def forward(self, outputs, targets):
+            return {
+                "loss_ce": outputs["pred_logits"].mean().square(),
+                "loss_point": outputs["pred_points"].mean().square(),
+            }
+
+    model = ToyModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    config = {
+        "training": {
+            "gradient_accumulation_steps": 2,
+            "gradient_clip_norm": 0.0,
+        },
+        "gpu": {
+            "mixed_precision": False,
+            "amp_dtype": "float16",
+            "pinned_memory": False,
+            "non_blocking": False,
+        },
+    }
+    batch = (torch.ones(1, 3, 32, 32), [{"point": torch.empty(0, 2)}])
+    losses = train_one_epoch(
+        model,
+        ToyCriterion(),
+        [batch, batch, batch],
+        optimizer,
+        None,
+        torch.device("cpu"),
+        config,
+    )
+    assert losses["optimizer_steps"] == 2

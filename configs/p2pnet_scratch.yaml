@@ -6,17 +6,20 @@ project:
 
 dataset:
   name: "JHU-CROWD++"
-  dataset_root: "C:\\SA_CC\\Crowd_Counting_Module\\P2PNet\\dataset\\JHU-CROWD++"
-  train_manifest: "train\\image_labels.txt"
-  validation_manifest: "val\\image_labels.txt"
-  test_manifest: "test\\image_labels.txt"
-  train_image_dir: "train\\images"
-  train_annotation_dir: "train\\gt"
-  validation_image_dir: "val\\images"
-  validation_annotation_dir: "val\\gt"
-  test_image_dir: "test\\images"
-  test_annotation_dir: "test\\gt"
+  dataset_root: "../P2PNet/dataset/JHU-CROWD++"
+  train_manifest: "train/image_labels.txt"
+  validation_manifest: "val/image_labels.txt"
+  test_manifest: "test/image_labels.txt"
+  train_image_dir: "train/images"
+  train_annotation_dir: "train/gt"
+  validation_image_dir: "val/images"
+  validation_annotation_dir: "val/gt"
+  test_image_dir: "test/images"
+  test_annotation_dir: "test/gt"
   num_workers: 0
+  prefetch_factor: 1
+  validation_max_side: 1024
+  validate_at_startup: true
   augmentation:
     random_scale_min: 0.7
     random_scale_max: 1.3
@@ -43,6 +46,7 @@ training:
   mode: "scratch"
   epochs: 350
   batch_size: 1
+  gradient_accumulation_steps: 1
   cpu_num_threads: 2
   cpu_interop_threads: 1
   learning_rate: 0.0001
@@ -55,16 +59,14 @@ training:
   validation_interval: 1
   gradient_clip_norm: 0.1
   log_dir: "logs"
-  tensorboard_log_dir: "logs\\tensorboard"
+  tensorboard_log_dir: "logs/tensorboard"
   smoke_test_train_batches: 2
   smoke_test_validation_batches: 1
-  resume: false
-  resume_checkpoint: ""
 
 gpu:
   device: "auto"
   gpu_device_index: 0
-  mixed_precision: false
+  mixed_precision: true
   amp_dtype: "float16"
   pinned_memory: false
   non_blocking: false
@@ -78,6 +80,7 @@ evaluation:
   inference_latency: true
   fps: true
   prediction_confidence_threshold: 0.5
+  batch_size: 1
   batch_size_one_benchmark: true
 
 checkpoints:
